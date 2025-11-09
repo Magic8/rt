@@ -1,8 +1,14 @@
 # HOA Chat System — Comprehensive Technical Checkpoint
 
-> **Version tag:** `rt-hoa_arch_v0.5` — superset of `rt-hoa_arch_v0.1` through `rt-hoa_arch_v0.4`. All earlier behavior remains valid; new sections add clarification loops, evidence anchoring, and answerability safeguards.
+> **Version tag:** `rt-hoa_arch_v0.6` — superset of `rt-hoa_arch_v0.1` through `rt-hoa_arch_v0.5` *plus* the multimodal search architecture (`search_multimodal_vs_v0.1`). All earlier behaviors remain valid; this version layers in the three-tier (Text/Image/Spatial) retrieval stack across every access tier.
 
 ## 1. Full System Stack Overview
+
+> **Priority Tiers:** All access control, vector-store retrieval, and policy logic operate on three numeric tiers:
+> - **Tier 1 (Public)** — renters/guests, maps to legacy “PUBLIC”.
+> - **Tier 2 (Owner)** — verified owners, legacy “OWNER”.
+> - **Tier 3 (Board)** — directors/PM, legacy “BOARD”.
+> When referencing tier-specific behavior below, both the numeric tier and the historical label are shown for clarity.
 
 | Component | Function / Role | Hosted On | Executed On | Service / Product |
 |------------|-----------------|------------|--------------|-------------------|
@@ -34,7 +40,7 @@ Entrypoint (FastAPI / Flask). Defines routes:
 Handles user authentication and session persistence.
 - `start_login(email)` → send magic link
 - `verify_login(token)` → create session + cookie
-- `get_tier_from_request(request)` → resolve user tier (PUBLIC / OWNER / BOARD)
+- `get_tier_from_request(request)` → resolve Priority Tier (`1/2/3`, mapped to Public/Owner/Board labels)
 
 ### roster.py
 Access control registry (AccessRoster + Sessions tables).
@@ -48,21 +54,41 @@ Bridges per-session state into each request.
 - `serialize_for_prompt(ctx)` → produces JSON injected into the system/user prompt blocks so the LLM sees known vs missing information.
 
 ### policy_engine.py
-Builds OpenAI Responses API call per tier.
+Builds OpenAI Responses API call per Priority Tier.
 - Selects vector stores and web search tools.
 - Embeds strict instruction block:
   - 3‑level answer format (Level 1/2/3)
   - Legal hierarchy enforcement
   - Evidence anchoring / conflict reporting requirements
 - Tool selection logic:
-  - PUBLIC → public stores + law tools
-  - OWNER  → + private_static + private_dynamic
-  - BOARD  → + privileged_dynamic
+  - **Tier 1 (Public)** → Tier 1 vector stores + law tools
+  - **Tier 2 (Owner)** → Tier 1 set + private_static + private_dynamic
+  - **Tier 3 (Board)** → Tier 2 set + privileged_dynamic
 
 ### qa_preflight.py (new)
 Answerability gate that runs before OpenAI is invoked.
 - `check(question, session_ctx, prior_turns)` → returns `clarify`, `proceed`, or `proceed_after_clarify_timeout` envelopes.
 - Uses configurable thresholds (`GATE_TAU_INTENT`, etc.) and updates clarify counters stored in `session_context`.
+
+### retrieval_orchestrator.py (new)
+Coordinates Layer A/B/C lookups prior to invoking the LLM.
+- `route_query(question, tier, session_ctx)` → decides which layers/tools (text, image, spatial) to prime.
+- `gather_multimodal_context()` → fetches Markdown chunks, image captions, and spatial JSON blobs; attaches them as tool inputs or context for the Responses API request.
+
+### vision_catalog.py (new)
+Indexes Layer B assets (floor plans, exhibits).
+- `register_image(file_id, metadata)` → stores caption + tags.
+- `search_captions(query, tier)` → returns image references for retrieval_orchestrator.
+
+### spatial_index.py (new)
+Stores and queries Layer C geometry JSON.
+- `nearest(feature_type, subject_id)` → deterministic calculator for egress/amenity lookups.
+- `path_between(start_id, end_id)` → optional corridor graph search with verification steps.
+
+### multimodal_ingest.py (new)
+Pipelines OCR → Markdown, image extraction, and spatial JSON ingestion.
+- `process_pdf(source_pdf)` → produces Layer A Markdown chunks, Layer B images/captions, Layer C geometry files; updates vector stores + locator index.
+- Reuses `ingestion_service.py` scheduling but adds ABBYY/OCR CLI hooks per §13 & §21.
 
 ### openai_client.py
 Low-level API client.
@@ -79,13 +105,13 @@ Post‑processing gatekeeper.
 - Returns safe fallback on violation
 
 ### qa.py
-Pipeline orchestrator.
+Pipeline orchestrator for multimodal retrieval.
 - `answer_question(question, tier)`
-  1. Build OpenAI request (policy_engine)
-  2. Execute (openai_client)
-  3. Validate (validator)
-  4. Log (audit)
-  5. Return answer
+  1. Call `qa_preflight` (clarify / proceed / timeout) + `retrieval_orchestrator` to assemble Layer A/B/C context.
+  2. Build OpenAI request (policy_engine + oai/models) with tiered tool list (vector stores, web search, spatial_query, deterministic tools).
+  3. Execute (oai/client) including critique→repair loops using deterministic tools.
+  4. Validate (validator) with evidence anchoring + clarify enforcement.
+  5. Log (audit) and persist updated `session_context` + cache entry; return answer or clarify envelope.
 
 ### audit.py
 - `log_interaction(...)` → timestamp, email, tier, question, answer, tool_trace, validator result
@@ -125,7 +151,9 @@ Implements deterministic helper endpoints invoked via OpenAI tool calls.
 | `vs_public_dynamic` | Rules, policies, announcements | PUBLIC | Quiet hours, smoking, parking |
 | `vs_private_static` | Budgets, election rules, insurance | OWNER | Stable, member‑only disclosures |
 | `vs_private_dynamic` | Meeting minutes, project notes | OWNER | Changing, owner‑viewable |
-| `vs_privileged_dynamic` | Executive session, legal, security | BOARD | Privileged board‑only materials |
+| `vs_privileged_dynamic` | Executive session, legal, security | BOARD | Privileged board-only materials |
+
+> **Multimodal note:** Each vector store now contains Layer A text chunks and Layer B image captions, each labeled with `layer` metadata. Layer C spatial JSON is referenced via `geom_id` metadata so retrieval orchestrator can hydrate geometry on demand. Access is enforced via Priority Tiers (1/2/3) mapped to Public/Owner/Board.
 
 ### 3.2 Web Search Groups (4 total)
 | Group | Scope | Example Domains |
@@ -176,11 +204,11 @@ Hierarchy of authority enforced:
 
 ## 6. Tier Matrix Summary
 
-| Tier | Who | Visible Stores | Hidden Stores | Purpose |
-|------|------|----------------|----------------|----------|
-| **Public (A)** | Renters / guests | public_static, public_dynamic | all private/privileged | general building & law info |
-| **Owner (B)** | Titled members | + private_static, private_dynamic | privileged_dynamic | budget, election, project info |
-| **Board (C)** | Directors / PM | + privileged_dynamic | none | internal executive materials |
+| Priority Tier | Legacy Label | Who | Visible Stores | Hidden Stores | Purpose |
+|---------------|--------------|-----|----------------|----------------|----------|
+| **Tier 1** | Public | Renters / guests | `public_static`, `public_dynamic` (Layers A/B/C metadata limited to common areas) | All private/privileged stores | General building & law info |
+| **Tier 2** | Owner | Titled members | Tier 1 + `private_static`, `private_dynamic` | `privileged_dynamic` | Budgets, election packets, project notes |
+| **Tier 3** | Board | Directors / PM | Tier 2 + `privileged_dynamic` | none | Executive/session materials, legal memos |
 
 ---
 
@@ -213,16 +241,20 @@ Hierarchy of authority enforced:
 ---
 ## 9. Tiered Tools Call Architecture
 
-| Tier | Access | Vector Stores | Web Search Groups | Purpose |
-|------|---------|----------------|-------------------|----------|
-| **Public (A)** | Anonymous / renter | `vs_public_static`, `vs_public_dynamic` | State + County + City | General HOA / law questions. |
-| **Owner (B)** | Verified owner | + `vs_private_static`, `vs_private_dynamic` | Federal + State + County + City | Adds member documents and state/federal law. |
-| **Board (C)** | Board / PM | + `vs_privileged_dynamic` | Federal + State + County + City | Full visibility, including privileged docs. |
+| Priority Tier | Access | Vector Stores (Layers A/B) | Spatial Tooling (Layer C) | Web Search Groups | Purpose |
+|---------------|--------|---------------------------|-------------------------|-------------------|----------|
+| **Tier 1 (Public)** | Anonymous / renter | `vs_public_static`, `vs_public_dynamic` | common-area geometry only | State + County + City | General HOA / law questions. |
+| **Tier 2 (Owner)** | Verified owner | Tier 1 + `vs_private_static`, `vs_private_dynamic` | units/amenities for owned units | Federal + State + County + City | Adds member documents and owner-specific spatial lookups. |
+| **Tier 3 (Board)** | Board / PM | Tier 2 + `vs_privileged_dynamic` | full geometry set (including restricted areas) | Federal + State + County + City | Full visibility, including privileged docs and spatial data. |
 
 ### Python Example – Building Tiered Tools Call
 ```python
-def build_tools_for_tier(tier: str):
-    # Common web-search tools
+PRIORITY_BY_LABEL = {"PUBLIC": 1, "OWNER": 2, "BOARD": 3}
+
+def build_tools_for_tier(tier_label: str):
+    priority = PRIORITY_BY_LABEL[tier_label]
+
+    # Common web-search tools (all tiers)
     law_tools = [
         {"type": "web_search", "name": "federal_law_search", "restrictions": {"domains": ["hud.gov", "ada.gov", "epa.gov"]}},
         {"type": "web_search", "name": "state_law_search", "restrictions": {"domains": ["leginfo.legislature.ca.gov", "davis-stirling.com"]}},
@@ -230,25 +262,23 @@ def build_tools_for_tier(tier: str):
         {"type": "web_search", "name": "city_law_search", "restrictions": {"domains": ["oaklandca.gov", "library.municode.com/ca/oakland", "fireprevention.oaklandca.gov"]}},
     ]
 
-    # Vector stores per tier
+    # Vector stores per Priority Tier (Layers A/B text+caption metadata)
     base_vectors = [
-        {"type": "file_search", "name": "public_static", "vector_store_ids": ["vs_public_static"]},
-        {"type": "file_search", "name": "public_dynamic", "vector_store_ids": ["vs_public_dynamic"]},
+        {"type": "file_search", "layer": "A/B", "name": "tier1_public", "vector_store_ids": ["vs_public_static", "vs_public_dynamic"]},
     ]
 
-    if tier == "OWNER":
+    if priority >= 2:
         base_vectors += [
-            {"type": "file_search", "name": "private_static", "vector_store_ids": ["vs_private_static"]},
-            {"type": "file_search", "name": "private_dynamic", "vector_store_ids": ["vs_private_dynamic"]},
+            {"type": "file_search", "layer": "A/B", "name": "tier2_owner", "vector_store_ids": ["vs_private_static", "vs_private_dynamic"]},
         ]
-    elif tier == "BOARD":
+    if priority == 3:
         base_vectors += [
-            {"type": "file_search", "name": "private_static", "vector_store_ids": ["vs_private_static"]},
-            {"type": "file_search", "name": "private_dynamic", "vector_store_ids": ["vs_private_dynamic"]},
-            {"type": "file_search", "name": "privileged_dynamic", "vector_store_ids": ["vs_privileged_dynamic"]},
+            {"type": "file_search", "layer": "A/B", "name": "tier3_board", "vector_store_ids": ["vs_privileged_dynamic"]},
         ]
 
-    return base_vectors + law_tools
+    spatial_tool = {"type": "spatial_query", "name": "layer_c_geometry", "permissions": priority}
+
+    return base_vectors + [spatial_tool] + law_tools
 ```
 
 ---
@@ -268,25 +298,31 @@ def build_tools_for_tier(tier: str):
          ▼
 ┌─────────────────────────────┐
 │ Python Backend (API on VPS) │
-│ • auth.py – session cookie   │
-│ • roster.py – AccessRoster   │
-│ • context_resolver.py – merge session context│
-│ • qa_preflight.py – clarification gate       │
-│ • policy_engine.py – builds request          │
-│ • openai_client.py – calls OpenAI            │
-│ • validator.py – checks hierarchy + evidence │
-│ • audit.py – logs to Supabase                │
+│ • auth.py – session cookie             │
+│ • roster.py – AccessRoster             │
+│ • context_resolver.py – session ctx    │
+│ • qa_preflight.py – answerability gate │
+│ ├─ Clarify → UI
+│ └─ Proceed → qa.py pipeline
+│        • retrieval_orchestrator.py – Layer A/B/C routing
+│        • policy_engine.py – tier tools + prompts
+│        • oai/models.py – model spec
+│        • oai/client.py – OpenAI call
+│        • deterministic_tools / spatial_index / vision_catalog
+│        • validator.py – hierarchy + evidence
+│        • audit.py – Supabase log
 └────────┬──────────────────────────┘
-         │ Responses API call (when gate allows)
+         │ Responses API call (with multimodal context)
          ▼
 ┌──────────────────────────┐
 │ OpenAI Cloud Services   │
-│ • 5 Vector Stores        │
-│ • 4 Web Search Groups    │
-│ • Deterministic tools    │
-│ → GPT‑5 Reasoning        │
+│ • Vector Stores (text + captions) │
+│ • File Store (PDF/Image/Geom)     │
+│ • Web Search Groups               │
+│ • Deterministic tools (quote_fetch/search_source/calc) │
+│ → GPT‑5 Reasoning                 │
 └────────┬─────────────────┘
-         │ Clarify envelope or validated answer
+         │ Clarify envelope or validated answer + media references
          ▼
 ┌──────────────────────────┐
 │ Netlify Chat UI shows reply│
@@ -303,9 +339,10 @@ def build_tools_for_tier(tier: str):
 | **context_resolver → qa_preflight.py** | Provides sanitized question + context for answerability gate. |
 | **qa_preflight → Netlify UI** | Sends Clarify Envelope when context missing. |
 | **qa_preflight → qa.py** | Signals `proceed`/`proceed_after_clarify_timeout`. |
-| **app.py → policy_engine.py** | Builds tier-specific tool set and prompt. |
+| **app.py → retrieval_orchestrator.py** | Routes question to Layers A/B/C, fetches multimodal context. |
+| **retrieval_orchestrator → policy_engine.py** | Supplies multimodal attachments + tool constraints per tier. |
 | **policy_engine → oai/client** | Submits Responses API request. |
-| **oai/client ↔ deterministic_tools.py** | Fetches quotes/search results/calculations. |
+| **oai/client ↔ deterministic_tools.py / spatial_index / vision_catalog** | Fetches quotes, captions, spatial answers. |
 | **oai/client → validator** | Returns draft + tool trace for validation. |
 | **validator → audit** | Logs final sanitized answer + evidence status. |
 | **qa.py → session_context** | Persists new clarifications / counters. |
@@ -329,23 +366,27 @@ def build_tools_for_tier(tier: str):
 
 | env_cfg key | Google Drive folder | Vector store ID | Tier | Notes |
 |--------------|----------------------|-----------------|------|-------|
-| `SRC_PUB_STAT` | `Public_Static/` | `vs_public_static` | PUBLIC | Recorded CC&Rs, bylaws, deeds |
-| `SRC_PUB_DYN` | `Public_Dynamic/` | `vs_public_dynamic` | PUBLIC | Rules, notices, announcements |
-| `SRC_OWN_STAT` | `Private_Static/` | `vs_private_static` | OWNER | Budgets, insurance, election packets |
-| `SRC_OWN_DYN` | `Private_Dynamic/` | `vs_private_dynamic` | OWNER | Minutes, project trackers |
-| `SRC_BOD_DYN` | `Privileged_Dynamic/` | `vs_privileged_dynamic` | BOARD | Executive + legal memos |
+| `SRC_PUB_STAT` | `Public_Static/` | `vs_public_static` | Tier 1 (Public) | Recorded CC&Rs, bylaws, deeds |
+| `SRC_PUB_DYN` | `Public_Dynamic/` | `vs_public_dynamic` | Tier 1 (Public) | Rules, notices, announcements |
+| `SRC_OWN_STAT` | `Private_Static/` | `vs_private_static` | Tier 2 (Owner) | Budgets, insurance, election packets |
+| `SRC_OWN_DYN` | `Private_Dynamic/` | `vs_private_dynamic` | Tier 2 (Owner) | Minutes, project trackers |
+| `SRC_BOD_DYN` | `Privileged_Dynamic/` | `vs_privileged_dynamic` | Tier 3 (Board) | Executive + legal memos |
 
 > **Mandatory principle:** Vector stores must only be refreshed via the webhook-triggered ingestion flow described below. Scheduled cron runs exist purely as a safety net and may not be used as the primary synchronization method in production.
 
-### 13.1 Sync Workflow (ingestion_service.py)
+### 13.1 Sync Workflow (ingestion_service.py + multimodal_ingest.py)
 1. `collect_drive_manifest(folder_env_key)` → uses Google Drive API to list PDFs/docs in the folder specified by `env_cfg`.
-2. `upload_batch_to_openai(files)` → pushes new/updated files into the OpenAI file store and tags them with `store_key` metadata.
-3. `refresh_vector_store(store_key)` →
-   - Creates the store if empty, otherwise calls OpenAI “file_batch add + recompute” to refresh embeddings.
-   - Updates `vector_store_syncs.last_synced_at` (see §14).
-4. `sync_vector_store(store_key)` orchestrates the above and is invoked:
-   - At deployment (boot strap all empty stores).
-   - By `ensure_daily_refresh()` (run via cron every 12 hours).
+2. For each PDF, `multimodal_ingest.process_pdf()` performs:
+   - **Layer A (Text):** OCR → Markdown (ABBYY `sandwich` PDF or `ocrmypdf` + `pandoc`), heading normalization, YAML metadata injection, chunking by Article/Section (≈0.5–1k tokens).
+   - **Layer B (Images):** `pdfimages` extraction, deterministic captioning, metadata assembly (building, level, features) and upload to File Store + caption embeddings.
+   - **Layer C (Spatial):** JSON geometry describing units/amenities/exits/vertical transport with scale info and centroid/polygon coordinates; stored alongside reference to source image.
+3. `upload_batch_to_openai(files)` → pushes Markdown, captions, spatial JSON into the OpenAI file store (with metadata linking to tiers) and tags them with `store_key`.
+4. `refresh_vector_store(store_key)` →
+   - Creates/updates the tier-specific vector stores with embeddings for Layer A chunks and Layer B captions (Layer C referenced via metadata ids like `geom_id`).
+   - Updates `vector_store_syncs.last_synced_at` and writes locator arrays to `source_locator_index` (see §14).
+5. `sync_vector_store(store_key)` orchestrates the above and is invoked:
+   - At deployment (bootstrap all empty stores).
+   - By `ensure_daily_refresh()` and Drive webhooks (mandatory per §13.2).
 
 ```python
 def sync_vector_store(store_key: str) -> None:
@@ -519,10 +560,15 @@ Response — Answer (success):
     { "type": "vector", "id": "vs_public_static:file_abc", "title": "CC&R 4.2" },
     { "type": "web", "domain": "oaklandca.gov", "url": "https://oaklandca.gov/..." }
   ],
+  "media": [
+    { "type": "image", "id": "floorplan_p097", "caption": "Building 1 – Level 1" },
+    { "type": "spatial", "id": "geom_p097", "details": { "unit": "101", "nearest_exit": "EXIT_A" } }
+  ],
   "tool_trace": { ... },
   "latency_ms": 1850
 }
 ```
+`media[]` carries optional Layer B/Layer C assets for clients that can render plan thumbnails or spatial highlights; each entry references the same `image_id`/`geom_id` cited in `evidence`.
 Response — Validator fallback / insufficient evidence:
 ```json
 {
@@ -578,6 +624,11 @@ Request body mirrors Google Drive push notifications. Only fields used: `resourc
 | `QA_MAX_REPAIRS` | Cap on critique→repair cycles when validator fails. |
 | `EVIDENCE_CONFLICT_DELTA_PERCENT` | Default numeric delta required before reporting conflicts as distinct values. |
 | `RESPONSE_CACHE_TTL_STATIC` / `RESPONSE_CACHE_TTL_DYNAMIC` | TTLs for cached answers based on doc class. |
+| `LAYER_A_OCR_BIN` | Path/CLI for ABBYY or `ocrmypdf`. |
+| `LAYER_B_IMAGE_DIR` / `LAYER_C_GEOM_DIR` | Working directories for extracted plan images and spatial JSON. |
+| `LAYER_B_VECTOR_ID` | Vector store ID holding image caption embeddings. |
+| `LAYER_C_BUCKET` | Storage bucket for geometry JSON + corridor graphs. |
+| `SPATIAL_SCALE_DEFAULT` | Fallback pixels-per-foot when missing. |
 
 All configuration keys live under an `env_cfg` module that loads `.env` values at startup and exposes `env_cfg["KEY"]`. Secrets never hard-coded; local development uses `.env.local`, production uses container secrets.
 
@@ -688,6 +739,8 @@ These additions are additive—older flows stay valid, but new modules ensure un
 | `quote_fetch` | `{ "source_id": str, "locator": str }` | `{ "quote": str, "locator": str }` | Returns verbatim span only. |
 | `search_source` | `{ "source_id": str, "pattern": str, "top_n": int }` | `[ {"locator": str, "snippet": str} ]` | Helps find candidate locators. |
 | `calc` | `{ "expr": str }` | `{ "value": str }` | Deterministic calculator; validator re-runs expression locally. |
+| `image_lookup` | `{ "image_id": str }` | `{ "caption": str, "file_url": str }` | Resolves Layer B asset for frontend display. |
+| `spatial_query` | `{ "geom_id": str, "op": "nearest|path|area", "subject": {...} }` | `{ "result": {...}, "evidence": {"geom_id": str, "locator": str} }` | Deterministic Layer C operations (nearest exit, corridor path, etc.). |
 
 ### 19.8 Locator Index Integration
 - `ingestion_service.py` now emits locator arrays per source and writes them to `source_locator_index` (see §14). Validators rely on this list instead of guessing structure, preserving the “no content assumptions” principle.
@@ -777,14 +830,15 @@ app.py (FastAPI)
   │ 5. qa_preflight.py (answerability gate)
   ├─ if Clarify → return Clarify Envelope to UI
   └─ else → qa.py pipeline
-        │ a. policy_engine.py builds tiered tool + prompt payload
-        │ b. oai/models.py supplies OAIModelSpec from env_cfg
-        │ c. oai/client.py calls OpenAI Responses API with:
-        │       - attachments from files.py (vector stores, web search groups)
+        │ a. retrieval_orchestrator.py routes query to Layer A/B/C
+        │ b. policy_engine.py builds tiered tool + prompt payload (with multimodal attachments)
+        │ c. oai/models.py supplies OAIModelSpec from env_cfg
+        │ d. oai/client.py calls OpenAI Responses API with:
+        │       - attachments from files.py (vector stores, web search groups, media refs)
         │       - strict response_format JSON schema
-        │ d. Deterministic tools (deterministic_tools.py) serve quote_fetch/search_source/calc requests
-        │ e. validator.py enforces format + evidence rules
-        │ f. qa.py logs to audit_log, updates session_context, writes cache
+        │ e. Deterministic tools (deterministic_tools.py, spatial_index.py, vision_catalog.py)
+        │ f. validator.py enforces format + evidence rules
+        │ g. qa.py logs to audit_log, updates session_context, writes cache
   ▼
 Supabase Postgres
   • access_roster, sessions, session_context, magic_links
@@ -802,3 +856,94 @@ Return payload:
 ```
 
 This diagram highlights files (`app.py`, `qa_preflight.py`, `qa.py`, `validator.py`, `ingestion_service.py`), data stores (Supabase tables, vector stores), and control/data movement between them.
+
+---
+
+## 21. Multimodal Search Stack (Layers A/B/C)
+
+### 21.1 Principles
+- Archive PDFs remain authoritative (“sandwich” searchable versions with visible image + hidden OCR text).
+- Search corpus is Markdown + metadata (Layer A), captioned image metadata (Layer B), and verified spatial JSON (Layer C).
+- Safety: life-safety answers (egress, routing) must reference Layer C annotations; no on-the-fly vision reasoning.
+- Determinism: all answers cite file_id, page, locator, image_id, or geom_id.
+
+### 21.2 Layers Overview
+| Layer | Function | Input | Stored As | Indexed For |
+|-------|----------|-------|-----------|-------------|
+| A – Text | Legal text, minutes, notices | OCR’d PDF → Markdown | `.md` chunks with YAML | Semantic search in tiered vector stores |
+| B – Image | Floor plans, diagrams | Extracted PNG/TIFF + captions | File Store image + caption metadata | Caption embeddings + metadata filters |
+| C – Spatial | Coordinates, exits, units, amenities | Verified JSON | `.json` per sheet | Geometry queries (nearest/path/area) |
+
+### 21.3 Layer A Details
+- OCR via ABBYY or `ocrmypdf` pipeline; convert to Markdown; clean headings using regex (Article/Section rules).
+- Add YAML metadata (doc_id, article, section, pages, doc_type, `file_id_master_pdf`).
+- Chunk by headings (≈500–1000 tokens) for vector store ingestion; embed with `text-embedding-3-large`.
+
+### 21.4 Layer B Details
+- Extract plan images with `pdfimages -png`.
+- Create deterministic captions listing building, level, units, vertical transport, amenities.
+- Store metadata: `doc_id`, `page`, `image_path`, `building`, `level`, `features`, `file_id`.
+- Upload raw image to File Store; embed caption text and store within the same tier-specific vector store as Layer A (with metadata flag `layer:"B"`).
+
+### 21.5 Layer C Details
+- JSON schema records scale, units, amenity polygons, exits, stairs, elevators, corridor graph, etc.
+- Example snippet:
+```json
+{
+  "doc_id": "428Alice_CC&Rs_ExhibitD",
+  "page": 97,
+  "image_file_id": "file_xyz",
+  "scale": {"pixels_per_foot": 3.2, "source": "title block 1/8\"=1'-0\""},
+  "units": [{"unit": "101", "centroid": [12.4,38.1]}],
+  "egress": [{"id": "EXIT_A", "centroid": [5.0,10.0]}]
+}
+```
+- Stored in Supabase/File Store; referenced by metadata `geom_id`. `spatial_index.py` loads JSON and executes deterministic functions (nearest exit, corridor path, area estimates).
+
+### 21.6 Query Routing & Retrieval
+- `retrieval_orchestrator.route_query()` inspects the sanitized question + policy metadata to decide which layers to tap.
+- Textual/legal questions → Layer A only.
+- “Show plan / where is X?” → Layer B; orchestrator fetches caption hits and returns image IDs for the UI to render.
+- Spatial questions (“nearest exit”, “distance to amenity”) → Layer C; orchestrator invokes `spatial_index` functions and returns numeric/context data with citations referencing the JSON source + image locator.
+- All retrieved assets (Markdown chunks, captions, geometry outputs) are attached to the Responses API call as structured tool inputs to keep the LLM deterministic.
+
+### 21.7 Response Assembly
+- AO facts referencing spatial/image data must cite both the text snippet (if available) and the asset metadata (e.g., `image:floorplan_p097`, `geom:geom_p097`).
+- Frontend displays optional `media` array:
+```json
+"media": [
+  {"type":"image","id":"floorplan_p097","caption":"Building 1 Level 1"},
+  {"type":"map","id":"geom_p097","highlight":{"unit":"101","path":[...]}}
+]
+```
+- Level 1/2 must still explain whether the answer is exact or contextual; Level 3 cites both textual and spatial references.
+
+### 21.8 Tooling & API Hooks
+- Deterministic tool extensions:
+  - `image_lookup(image_id)` → returns signed URL + caption.
+  - `spatial_query(geom_id, op, params)` → e.g., `{op:"nearest", "subject":"unit:101", "target":"exit"}`.
+- `env_cfg` gains paths/IDs for Layer B/C stores (`LAYER_B_VECTOR_ID`, `LAYER_C_BUCKET`, etc.).
+- `/ask` response schema (Section 16) already allows `evidence` + `status`; v0.6 optionally adds `media` and `spatial` keys for clients that can render images/maps.
+
+### 21.9 QA & Risk Checklist
+- OCR QA for every document (spot-check every Article, especially election rules and “No Cumulative Voting”).
+- Image fidelity: no downsampling; keep PNG/TIFF for plan linework.
+- Captions reviewed for accuracy; geometry verified with scale references.
+- Life-safety disclaimers included whenever spatial answers mention exits/occupancy.
+- Traceability: each asset linked back to page/exhibit + file_id.
+
+### 21.10 Automation Opportunities
+- Optional computer-vision helpers (symbol detection, polygon tracing) produce drafts; humans verify before ingest.
+- Corridor graphs stored alongside geometry to support path queries later.
+### 13.4 Layer-Specific Storage Layout
+```
+/corpus/<store_key>/
+  <doc_name>_Searchable.pdf     # “sandwich” PDF archived
+  <doc_name>.md                 # Layer A Markdown chunked
+  /images/                      # Layer B PNG/TIFF
+    p097_001.png
+  /spatial/
+    geom_p097.json              # Layer C geometry
+```
+- Each chunk/image/geom file records `doc_id`, `pages`, `file_id_master_pdf`, `vector_store_id`, and permitted tiers.
+- Vector stores reference these assets via metadata (`file_id`, `image_id`, `geom_id`). Retrieval orchestrator uses the metadata to fetch the appropriate layer without re-uploading binaries.
